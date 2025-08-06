@@ -1,39 +1,82 @@
-/**
- * LLM Chat Application Template
- *
- * A simple chat application using Cloudflare Workers AI.
- * This template demonstrates how to implement an LLM-powered chat interface with
- * streaming responses using Server-Sent Events (SSE).
- *
- * @license MIT
- */
-import { Env, ChatMessage } from "./types";
+import { Router } from 'itty-router';
+import { Ai } from '@cloudflare/ai';
 
-// Model ID for Workers AI model
-// https://developers.cloudflare.com/workers-ai/models/
-const MODEL_ID = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+// Define the streaming API endpoint for Gemini
+const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:streamGenerateContent';
 
-// Default system prompt
-const SYSTEM_PROMPT =
-  "You are a helpful, friendly assistant. Provide concise and accurate responses.";
+const router = Router();
 
-export default {
-  /**
-   * Main request handler for the Worker
-   */
-  async fetch(
-    request: Request,
-    env: Env,
-    ctx: ExecutionContext,
-  ): Promise<Response> {
-    const url = new URL(request.url);
+router.post('/api/chat', async (request, env) => {
+  const { messages } = await request.json();
 
-    // Handle static assets (frontend)
-    if (url.pathname === "/" || !url.pathname.startsWith("/api/")) {
-      return env.ASSETS.fetch(request);
+  if (!messages || messages.length === 0) {
+    return new Response('No messages provided.', { status: 400 });
+  }
+
+  // Use a WritableStream to write the Gemini response directly to the client
+  const { readable, writable } = new TransformStream();
+
+  // Attempt to use Gemini API first
+  try {
+    const requestBody = {
+      contents: messages,
+      generationConfig: {
+        temperature: 0.9,
+      },
+    };
+
+    const geminiResponse = await fetch(`${GEMINI_API_URL}?key=${env.GEMINI_API_KEY}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(requestBody),
+    });
+
+    if (!geminiResponse.ok) {
+      throw new Error(`Gemini API error: ${geminiResponse.status}`);
     }
 
-    // API Routes
+    // Pipe the streaming response from Gemini to our client
+    geminiResponse.body.pipeTo(writable);
+    return new Response(readable, {
+      headers: { 'Content-Type': 'text/plain' },
+    });
+
+  } catch (geminiError) {
+    console.error('Gemini API call failed, falling back to Workers AI:', geminiError);
+
+    // Fallback to Workers AI
+    try {
+      const ai = new Ai(env.AI);
+      const aiResponse = await ai.run(
+        env.WORKERS_AI_MODEL,
+        {
+          messages: [{ role: "user", content: messages[messages.length - 1].content }],
+        }
+      );
+      
+      const aiMessage = aiResponse.response;
+      
+      return new Response(`(Fallback from Workers AI): ${aiMessage}`, {
+        headers: { 'Content-Type': 'text/plain' },
+      });
+      
+    } catch (aiError) {
+      console.error('Workers AI also failed:', aiError);
+      return new Response(`Both APIs failed. Error: ${aiError.message}`, { status: 500 });
+    }
+  }
+});
+
+// Serve the static HTML page from the public directory for all other requests
+router.get('*', async (request, env) => {
+  return env.ASSETS.fetch(request);
+});
+
+export default {
+  fetch: router.handle,
+};
     if (url.pathname === "/api/chat") {
       // Handle POST requests for chat
       if (request.method === "POST") {
