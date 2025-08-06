@@ -1,158 +1,109 @@
-/**
- * LLM Chat App Frontend
- *
- * Handles the chat UI interactions and communication with the backend API.
- */
+import { Router } from 'itty-router';
+import { Ai } from '@cloudflare/ai';
 
-// DOM elements
-const chatMessages = document.getElementById("chat-messages");
-const userInput = document.getElementById("user-input");
-const sendButton = document.getElementById("send-button");
-const typingIndicator = document.getElementById("typing-indicator");
+const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:streamGenerateContent';
 
-// Chat state
-let chatHistory = [
-  {
-    role: "assistant",
-    content:
-      "Hello! I'm an LLM chat app powered by Cloudflare Workers AI. How can I help you today?",
-  },
-];
-let isProcessing = false;
+const router = Router();
 
-// Auto-resize textarea as user types
-userInput.addEventListener("input", function () {
-  this.style.height = "auto";
-  this.style.height = this.scrollHeight + "px";
-});
+router.post('/api/chat', async (request, env) => {
+  const { messages } = await request.json();
 
-// Send message on Enter (without Shift)
-userInput.addEventListener("keydown", function (e) {
-  if (e.key === "Enter" && !e.shiftKey) {
-    e.preventDefault();
-    sendMessage();
+  if (!messages || messages.length === 0) {
+    return new Response('No messages provided.', { status: 400 });
   }
-});
 
-// Send button click handler
-sendButton.addEventListener("click", sendMessage);
+  const { readable, writable } = new TransformStream();
 
-/**
- * Sends a message to the chat API and processes the response
- */
-async function sendMessage() {
-  const message = userInput.value.trim();
-
-  // Don't send empty messages
-  if (message === "" || isProcessing) return;
-
-  // Disable input while processing
-  isProcessing = true;
-  userInput.disabled = true;
-  sendButton.disabled = true;
-
-  // Add user message to chat
-  addMessageToChat("user", message);
-
-  // Clear input
-  userInput.value = "";
-  userInput.style.height = "auto";
-
-  // Show typing indicator
-  typingIndicator.classList.add("visible");
-
-  // Add message to history
-  chatHistory.push({ role: "user", content: message });
-
+  // Try to use Gemini
   try {
-    // Create new assistant response element
-    const assistantMessageEl = document.createElement("div");
-    assistantMessageEl.className = "message assistant-message";
-    assistantMessageEl.innerHTML = "<p></p>";
-    chatMessages.appendChild(assistantMessageEl);
-
-    // Scroll to bottom
-    chatMessages.scrollTop = chatMessages.scrollHeight;
-
-    // Send request to API
-    const response = await fetch("/api/chat", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
+    const requestBody = {
+      contents: messages,
+      generationConfig: {
+        temperature: 0.9,
       },
-      body: JSON.stringify({
-        messages: chatHistory,
-      }),
+    };
+
+    const geminiResponse = await fetch(`${GEMINI_API_URL}?key=${env.GEMINI_API_KEY}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(requestBody),
     });
 
-    // Handle errors
-    if (!response.ok) {
-      throw new Error("Failed to get response");
+    if (!geminiResponse.ok) {
+      throw new Error(`Gemini API error: ${geminiResponse.status}`);
     }
 
-    // Process streaming response
-    const reader = response.body.getReader();
+    // Process the streaming response and reformat it for the frontend
+    const reader = geminiResponse.body.getReader();
+    const writer = writable.getWriter();
+    const encoder = new TextEncoder();
     const decoder = new TextDecoder();
-    let responseText = "";
+    
+    // Read the stream and reformat chunks
+    const processStream = async () => {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          writer.close();
+          break;
+        }
 
-    while (true) {
-      const { done, value } = await reader.read();
+        const chunk = decoder.decode(value);
+        const data = JSON.parse(chunk);
 
-      if (done) {
-        break;
-      }
-
-      // Decode chunk
-      const chunk = decoder.decode(value, { stream: true });
-
-      // Process SSE format
-      const lines = chunk.split("\n");
-      for (const line of lines) {
-        try {
-          const jsonData = JSON.parse(line);
-          if (jsonData.response) {
-            // Append new content to existing text
-            responseText += jsonData.response;
-            assistantMessageEl.querySelector("p").textContent = responseText;
-
-            // Scroll to bottom
-            chatMessages.scrollTop = chatMessages.scrollHeight;
-          }
-        } catch (e) {
-          console.error("Error parsing JSON:", e);
+        if (data.candidates && data.candidates[0].content.parts[0].text) {
+          const text = data.candidates[0].content.parts[0].text;
+          const formattedChunk = JSON.stringify({ response: text }) + '\n';
+          await writer.write(encoder.encode(formattedChunk));
         }
       }
+    };
+
+    processStream().catch(e => {
+        console.error("Stream processing error:", e);
+        writer.close();
+    });
+
+    return new Response(readable, {
+      headers: { 'Content-Type': 'application/x-ndjson' },
+    });
+
+  } catch (geminiError) {
+    console.error('Gemini API call failed, falling back to Workers AI:', geminiError);
+
+    // Fallback to Workers AI
+    try {
+      const ai = new Ai(env.AI);
+      const aiResponse = await ai.run(
+        env.WORKERS_AI_MODEL,
+        {
+          messages: [{ role: "user", content: messages[messages.length - 1].content }],
+        }
+      );
+      
+      const aiMessage = aiResponse.response;
+      const formattedChunk = JSON.stringify({ response: `(Fallback from Workers AI): ${aiMessage}` }) + '\n';
+      
+      return new Response(formattedChunk, {
+        headers: { 'Content-Type': 'application/x-ndjson' },
+      });
+      
+    } catch (aiError) {
+      console.error('Workers AI also failed:', aiError);
+      return new Response(JSON.stringify({ error: `Both APIs failed. Error: ${aiError.message}` }) + '\n', {
+        status: 500,
+        headers: { 'Content-Type': 'application/x-ndjson' },
+      });
     }
-
-    // Add completed response to chat history
-    chatHistory.push({ role: "assistant", content: responseText });
-  } catch (error) {
-    console.error("Error:", error);
-    addMessageToChat(
-      "assistant",
-      "Sorry, there was an error processing your request.",
-    );
-  } finally {
-    // Hide typing indicator
-    typingIndicator.classList.remove("visible");
-
-    // Re-enable input
-    isProcessing = false;
-    userInput.disabled = false;
-    sendButton.disabled = false;
-    userInput.focus();
   }
-}
+});
 
-/**
- * Helper function to add message to chat
- */
-function addMessageToChat(role, content) {
-  const messageEl = document.createElement("div");
-  messageEl.className = `message ${role}-message`;
-  messageEl.innerHTML = `<p>${content}</p>`;
-  chatMessages.appendChild(messageEl);
+router.get('*', async (request, env) => {
+  return env.ASSETS.fetch(request);
+});
 
-  // Scroll to bottom
-  chatMessages.scrollTop = chatMessages.scrollHeight;
-}
+export default {
+  fetch: router.handle,
+};
