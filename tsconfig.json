@@ -12,9 +12,7 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "types": [
-      "@cloudflare/workers-types",
-      "@cloudflare/ai",
-      "itty-router"
+      "@cloudflare/workers-types"
     ],
     "outDir": "./dist"
   },
